@@ -8,13 +8,18 @@
 #include <netinet/in.h>
 #include <getopt.h>
 #include <pthread.h>
+#include <stdarg.h>
 
 #define STARTING 0
-#define SERVICE 1
+#define RUNNING 1
 #define STOPPED 2
 
 
 #define CONST_STR_LEN(s) s, sizeof(s) - 1
+#define mylog(...) if(options.log_facility>=0){sprintf(&logbuffer, __VA_ARGS__ ); syslog(LOG_NOTICE,&logbuffer); }
+
+char logbuffer[256];
+int pipe_fd[2];
 
 struct global_option {
     char *user;			/* -h option */
@@ -22,6 +27,7 @@ struct global_option {
     int kill_signal;
     int test_port;
     char * daemon;
+    int log_facility;
 } options;
 
 struct proc_status {
@@ -48,11 +54,14 @@ int main(int argc, char *argv[])
 
     bzero(&proc_stat, sizeof(proc_stat));
     bzero(&options, sizeof(options));
+    
+    options.log_facility = -1;
+    options.kill_signal= SIGTERM;
 
     i_am_root = (getuid() == 0);
     while (-1 !=
             (o =
-             getopt(argc, argv, "p:u:g:k:d:"))) {
+             getopt(argc, argv, "p:u:g:k:d:l:"))) {
         switch (o) {
             case 'h': return usage();
             case 'u': if (i_am_root) { options.user = optarg; } break;
@@ -60,6 +69,7 @@ int main(int argc, char *argv[])
             case 'k': options.kill_signal = strtol(optarg,NULL,10); break;
             case 'p': options.test_port = strtol(optarg, NULL, 10); break;
             case 'd': options.daemon = optarg; break;
+            case 'l': options.log_facility = log_facility(optarg); break;
             default: 1;
         }
     }
@@ -74,23 +84,12 @@ int main(int argc, char *argv[])
     proc_stat.argc = argc - optind - 1;
 
     return controller();
-    /* openlog("launch" , LOG_NDELAY,global_args.log_facility); */
-    /* char *message=malloc(sizeof(char)*100); */
-    /*
-     * sprintf(message,"Geass ->
-     * %s:%d\n",global_args.host,global_args.port);
-     */
-    /* syslog(LOG_NOTICE,message); */
-    /* free(message); */
-    /* return fcgi_spawn_connection(fcgi_app_argv); */
-    /* return 0; */
 }
 
 
 
 int start_child()
 {
-
     pid_t mypid = getpid();
     setpgid(mypid, mypid);
 
@@ -99,6 +98,8 @@ int start_child()
 
     switch (child) {
         case 0:
+            close(pipe_fd[1]);
+            dup2(pipe_fd[0],0);
             if (proc_stat.argc > 0) {
                 return execvp(proc_stat.path, proc_stat.argv);
             } else {
@@ -114,10 +115,12 @@ int start_child()
             return -1;
 
         default:
+            close(pipe_fd[0]);
             proc_stat.pid = child;
             int a=1;
+            mylog("start child pid=%d",child);
             if(wait_for_service()){
-                proc_stat.running = SERVICE;
+                proc_stat.running = RUNNING;
                 wait_for_stop();
                 clean_child();
             }else{
@@ -173,10 +176,6 @@ int is_running(){
 
 int wait_for_service(){
 
-/*    printf("waiting..\n");*/
-/*    wait_for_startup();*/
-/*    printf("started..\n");*/
-
     if(options.test_port){
 
         struct sockaddr_in service;
@@ -209,9 +208,13 @@ int controller()
     int rt, last_status;
     fd_set rd;
     char buff[50];
-    FD_ZERO(&rd);
-    FD_SET(0, &rd);
     pthread_t tid;
+    pipe(pipe_fd);
+    bzero(&buff,sizeof(buff));
+    
+    if(options.log_facility>=0){
+        openlog("launcher" , LOG_NDELAY,options.log_facility);
+    }
 
     last_status = proc_stat.running = STARTING;
     pthread_create(&tid, NULL, (int *) start_child, NULL);
@@ -220,15 +223,27 @@ int controller()
     while (proc_stat.running<STOPPED) {
         if(proc_stat.running!=last_status){
             last_status = proc_stat.running;
-            printf("inservice\n");
+            printf("!inservice\n");
         }
-        rt = select(1, &rd, NULL, NULL, &tv);
+        FD_ZERO(&rd);
+        FD_SET(0, &rd);
+        rt = select(FD_SETSIZE, &rd, NULL, NULL, &tv);
         if (rt == -1) {
             perror("select");
             return -1;
-        } else if (rt > 0) {
-            read(0, buff, 50);
-            printf("< %s", buff);
+        } else if (FD_ISSET(0, &rd)) {
+            read(0, buff, sizeof(buff));
+            if(buff[0]==0){
+                mylog("kill(%d) %d",  options.kill_signal, proc_stat.pid);
+                kill(proc_stat.pid, options.kill_signal);
+                waitpid(proc_stat.pid, NULL, 0);
+                mylog("stoped: %d", proc_stat.pid);
+                exit(0);
+            }else{
+                mylog(&buff);
+                write(pipe_fd[1],&buff,sizeof(buff));
+                bzero(&buff,sizeof(buff));
+            }
         }
     }
 
@@ -236,7 +251,6 @@ int controller()
     printf("stopped %d %d\n", proc_stat.code, proc_stat.signal);
     return 0;
 }
-
 
 int usage()
 {

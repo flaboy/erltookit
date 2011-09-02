@@ -1,4 +1,3 @@
-include ../include.mk
 
 
 # don't c-compile anything on win32 (yet)
